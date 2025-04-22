@@ -15,9 +15,9 @@ class TetrisBot:
         self.matrix_height = 20  # Standard Tetris height
         self.last_matrix = None
         self.debug = False
-        self.last_matrix_update = 0
-        self.pause_check_interval = 3  # Check for paused status every 3 seconds
         self.game_paused = False  # Track if the game is currently paused
+        self.pause_start_time = 0  # Track when the game was paused
+        self.last_resume_attempt = 0  # Track when we last tried to resume
     
     def start(self):
         """Start the bot and the game loop"""
@@ -25,16 +25,14 @@ class TetrisBot:
         print(f"Using API URL: {self.base_url}")
         self.running = True
         
-        # First check if the game is paused and resume if needed
+        # Check initial game status
         status = self.get_status()
         if status and status.get('state') == 'PAUSED':
             self.game_paused = True
-            print("Game is paused. Attempting to resume...")
-            self.send_command('RESUME')
-            time.sleep(1)  # Wait a bit for the game to resume
-            self.game_paused = False  # Assume we successfully resumed
+            self.pause_start_time = time.time()
+            print("Game is paused. Will auto-resume after 3 seconds.")
         
-        # Send restart command to start a fresh game
+        # Send restart command to start the game
         response = self.send_command('RESTART')
         if not response:
             print("Failed to restart game. Checking API connection...")
@@ -72,24 +70,9 @@ class TetrisBot:
                 print(f"Error getting status: Status code {response.status_code}")
                 print(f"Response text: {response.text[:100]}")
                 return None
-        except requests.exceptions.Timeout:
-            print(f"Timeout getting status")
-            return None
-        except requests.exceptions.ConnectionError:
-            print(f"Connection error getting status")
-            return None
         except Exception as e:
             print(f"Error getting status: {e}")
             return None
-    
-    def is_game_paused(self):
-        """Check if the game is paused using the status endpoint"""
-        status = self.get_status()
-        if status and 'state' in status:
-            if self.debug:
-                print(f"Game state: {status['state']}")
-            return status['state'] == 'PAUSED'
-        return False  # Default to not paused if we can't determine
     
     def check_api_connection(self):
         """Check if we can connect to the API"""
@@ -125,63 +108,58 @@ class TetrisBot:
         """Main game loop that continuously gets state and sends commands"""
         connection_errors = 0
         max_connection_errors = 5
-        last_pause_check = time.time()
+        last_status_check = 0
         
         while self.running:
             try:
                 current_time = time.time()
                 
-                # Periodically check if the game is paused
-                if current_time - last_pause_check > self.pause_check_interval:
+                # Check game status every second
+                if current_time - last_status_check > 1:
                     status = self.get_status()
+                    last_status_check = current_time
                     
                     if status and 'state' in status:
-                        # If game just became paused
-                        if status['state'] == 'PAUSED' and not self.game_paused:
-                            print("Game is paused. Attempting to resume...")
-                            self.send_command('RESUME')
-                            time.sleep(0.5)
-                            # Check if resume was successful
-                            status = self.get_status()
-                            self.game_paused = status and status.get('state') == 'PAUSED'
-                            if self.game_paused:
-                                print("Resume attempt failed, game is still paused. Will check again later.")
-                            else:
-                                print("Game successfully resumed.")
+                        is_currently_paused = status['state'] == 'PAUSED'
                         
-                        # If game was paused but now is playing
-                        elif status['state'] == 'PLAYING' and self.game_paused:
+                        # Game just became paused
+                        if is_currently_paused and not self.game_paused:
+                            print("Game is now paused. Will auto-resume after 3 seconds.")
+                            self.game_paused = True
+                            self.pause_start_time = current_time
+                        
+                        # Game was paused but now is playing
+                        elif not is_currently_paused and self.game_paused:
                             print("Game has been resumed.")
                             self.game_paused = False
-                        
-                        # Update game_paused status based on current state
-                        else:
-                            self.game_paused = status['state'] == 'PAUSED'
-                    
-                    # Update the pause check timestamp
-                    last_pause_check = current_time
                 
-                # If game is paused, don't send any gameplay commands
+                # If the game is paused
                 if self.game_paused:
-                    print("Game is paused. Waiting for resume...")
-                    time.sleep(1)  # Wait a bit longer while paused
+                    # Auto-resume if paused for more than 3 seconds AND we haven't tried to resume in the last 3 seconds
+                    if (current_time - self.pause_start_time > 3) and (current_time - self.last_resume_attempt > 3):
+                        print("Auto-resuming game after 3 seconds...")
+                        self.send_command('RESUME')
+                        self.last_resume_attempt = current_time
+                        print("Will wait 3 seconds before trying to resume again if needed.")
+                        
+                    # Skip the rest of the loop while paused
+                    time.sleep(0.2)
                     continue
                 
-                # 1. Get current game state
+                # Only execute this section when the game is not paused
                 matrix = self.get_matrix()
                 
                 if matrix:
-                    # Reset error counter and update matrix timestamp if we got valid data
+                    # Reset error counter if we got valid data
                     connection_errors = 0
-                    self.last_matrix_update = current_time
                     
                     if self.debug:
                         self.print_matrix(matrix)
                     
-                    # 2. Analyze the matrix and decide next move
+                    # Analyze the matrix and decide next move
                     next_move = self.decide_next_move(matrix)
                     
-                    # 3. Send the command
+                    # Send the command
                     self.send_command(next_move)
                     
                     # Store the current matrix for comparison in next iteration
@@ -190,30 +168,14 @@ class TetrisBot:
                     connection_errors += 1
                     print(f"No valid matrix data received ({connection_errors}/{max_connection_errors})")
                     
-                    # If we haven't received a matrix update in a while, check if game is paused
-                    if current_time - self.last_matrix_update > 5:
-                        print("No matrix updates received recently. Checking game status...")
-                        status = self.get_status()
-                        if status:
-                            self.game_paused = status.get('state') == 'PAUSED'
-                            if self.game_paused:
-                                print("Game is paused. Attempting to resume...")
-                                self.send_command('RESUME')
-                                time.sleep(0.5)
-                                # Check if resume was successful
-                                status = self.get_status()
-                                self.game_paused = status and status.get('state') == 'PAUSED'
-                                if not self.game_paused:
-                                    print("Game successfully resumed.")
-                        self.last_matrix_update = current_time
-                    
                     if connection_errors >= max_connection_errors:
                         print("Too many connection errors. Checking API connection...")
                         self.check_api_connection()
                         connection_errors = 0  # Reset counter after check
                 
-                # 4. Wait a bit before next iteration
-                time.sleep(0.2)  # 200ms delay between commands
+                # Wait before next iteration
+                time.sleep(0.2)
+                
             except Exception as e:
                 print(f"Error in game loop: {e}")
                 time.sleep(1)  # Wait a bit longer if there's an error
@@ -457,8 +419,6 @@ def parse_arguments():
                         help='Enable debug output')
     parser.add_argument('--api-path', type=str, default='/api/tetris/',
                         help='API path (default: /api/tetris/)')
-    parser.add_argument('--no-autostart', action='store_true',
-                        help='Don\'t automatically restart the game on startup')
     
     return parser.parse_args()
 
@@ -478,9 +438,9 @@ if __name__ == "__main__":
         setattr(self, 'matrix_height', 20),
         setattr(self, 'last_matrix', None),
         setattr(self, 'debug', args.debug),
-        setattr(self, 'last_matrix_update', 0),
-        setattr(self, 'pause_check_interval', 3),
-        setattr(self, 'game_paused', False)
+        setattr(self, 'game_paused', False),
+        setattr(self, 'pause_start_time', 0),
+        setattr(self, 'last_resume_attempt', 0)
     )[-1]
     
     # Create and start the bot

@@ -5,6 +5,7 @@ import signal
 import sys
 import argparse
 import json
+from tetris_strategy import TetrisStrategy
 
 class TetrisBot:
     def __init__(self, session_id, server_url='tetris-server.example.com', port=3001):
@@ -13,17 +14,22 @@ class TetrisBot:
         self.running = False
         self.matrix_width = 10  # Standard Tetris width
         self.matrix_height = 20  # Standard Tetris height
-        self.last_matrix = None
         self.debug = False
         self.game_paused = False  # Track if the game is currently paused
         self.pause_start_time = 0  # Track when the game was paused
         self.last_resume_attempt = 0  # Track when we last tried to resume
+        self.game_over = False  # Track if the game is in GAME_OVER state
+        self.last_restart_attempt = 0  # Track when we last tried to restart
+        self.strategy = None  # Will be initialized in start()
     
     def start(self):
         """Start the bot and the game loop"""
         print(f"Starting bot for session: {self.session_id}")
         print(f"Using API URL: {self.base_url}")
         self.running = True
+        
+        # Initialize the strategy
+        self.strategy = TetrisStrategy(debug=self.debug)
         
         # Check initial game status
         status = self.get_status()
@@ -121,6 +127,7 @@ class TetrisBot:
                     
                     if status and 'state' in status:
                         is_currently_paused = status['state'] == 'PAUSED'
+                        is_game_over = status['state'] == 'GAME_OVER'
                         
                         # Game just became paused
                         if is_currently_paused and not self.game_paused:
@@ -132,11 +139,34 @@ class TetrisBot:
                         elif not is_currently_paused and self.game_paused:
                             print("Game has been resumed.")
                             self.game_paused = False
+                            
+                        # Game just entered GAME_OVER state
+                        if is_game_over and not self.game_over:
+                            print("Game is now in GAME_OVER state. Will auto-restart every 5 seconds.")
+                            self.game_over = True
+                            
+                        # Game was over but now is playing
+                        elif not is_game_over and self.game_over:
+                            print("Game has been restarted.")
+                            self.game_over = False
+                
+                # If the game is in GAME_OVER state
+                if self.game_over:
+                    # Auto-restart if game over for more than 5 seconds since last attempt
+                    if current_time - self.last_restart_attempt > 5:
+                        print("Auto-restarting game after game over...")
+                        self.send_command('RESTART')
+                        self.last_restart_attempt = current_time
+                        print("Will attempt to restart again in 5 seconds if still game over.")
+                        
+                    # Skip the rest of the loop while in game over state
+                    time.sleep(0.2)
+                    continue
                 
                 # If the game is paused
                 if self.game_paused:
-                    # Auto-resume if paused for more than 3 seconds AND we haven't tried to resume in the last 3 seconds
-                    if (current_time - self.pause_start_time > 3) and (current_time - self.last_resume_attempt > 3):
+                    # Auto-resume if paused for more than 3 seconds
+                    if current_time - self.pause_start_time > 3 and current_time - self.last_resume_attempt > 3:
                         print("Auto-resuming game after 3 seconds...")
                         self.send_command('RESUME')
                         self.last_resume_attempt = current_time
@@ -146,7 +176,7 @@ class TetrisBot:
                     time.sleep(0.2)
                     continue
                 
-                # Only execute this section when the game is not paused
+                # Only execute this section when the game is not paused or game over
                 matrix = self.get_matrix()
                 
                 if matrix:
@@ -161,9 +191,6 @@ class TetrisBot:
                     
                     # Send the command
                     self.send_command(next_move)
-                    
-                    # Store the current matrix for comparison in next iteration
-                    self.last_matrix = matrix
                 else:
                     connection_errors += 1
                     print(f"No valid matrix data received ({connection_errors}/{max_connection_errors})")
@@ -254,146 +281,9 @@ class TetrisBot:
             print(f"Error getting matrix: {e}")
             return []
     
-    def get_heights(self, matrix):
-        """Get the height of each column in the matrix"""
-        heights = [0] * self.matrix_width
-        
-        # Initialize with maximum height
-        for i in range(self.matrix_width):
-            heights[i] = self.matrix_height
-            
-        # Find the highest block in each column
-        for row in matrix:
-            if "cells" in row:
-                line_num = row["line"]
-                cells = row["cells"]
-                for col in range(min(len(cells), self.matrix_width)):
-                    if cells[col] > 0 and heights[col] == self.matrix_height:
-                        # This is the highest block in this column
-                        heights[col] = line_num
-        
-        # Convert from line numbers to heights
-        for i in range(self.matrix_width):
-            heights[i] = self.matrix_height - heights[i]
-            
-        return heights
-    
-    def count_holes(self, matrix):
-        """Count the number of holes in the matrix (empty cells with blocks above them)"""
-        holes = 0
-        column_tops = [self.matrix_height] * self.matrix_width  # Start with max height
-        
-        # Find the top piece in each column
-        for row in matrix:
-            if "cells" in row:
-                line_num = row["line"]
-                cells = row["cells"]
-                for col in range(min(len(cells), self.matrix_width)):
-                    if cells[col] > 0:
-                        column_tops[col] = min(column_tops[col], line_num)
-        
-        # Count holes (empty cells below the top block in each column)
-        for row in matrix:
-            if "cells" in row:
-                line_num = row["line"]
-                cells = row["cells"]
-                for col in range(min(len(cells), self.matrix_width)):
-                    if cells[col] == 0 and line_num > column_tops[col]:
-                        holes += 1
-        
-        return holes
-    
-    def identify_active_piece(self, matrix):
-        """Attempt to identify the active piece location by comparing with last matrix"""
-        if not self.last_matrix:
-            return None
-            
-        # Find cells that are different between current and last matrix
-        active_cells = []
-        
-        for row in matrix:
-            if "cells" in row:
-                line_num = row["line"]
-                cells = row["cells"]
-                
-                # Find matching row in last matrix
-                last_row = None
-                for lr in self.last_matrix:
-                    if "line" in lr and lr["line"] == line_num and "cells" in lr:
-                        last_row = lr
-                        break
-                
-                if last_row:
-                    last_cells = last_row.get("cells", [])
-                    for col in range(min(len(cells), len(last_cells))):
-                        # Cell has a piece now but was empty before
-                        if cells[col] > 0 and col < len(last_cells) and last_cells[col] == 0:
-                            active_cells.append((line_num, col))
-        
-        return active_cells if active_cells else None
-    
     def decide_next_move(self, matrix):
-        """More advanced algorithm to decide the next move based on the matrix state"""
-        # If matrix is empty or invalid, move randomly
-        if not matrix:
-            return random.choice(['LEFT', 'RIGHT', 'DOWN', 'ROTATE_CW'])
-            
-        # Get heights of columns
-        heights = self.get_heights(matrix)
-        if self.debug:
-            print(f"Column heights: {heights}")
-        
-        # Calculate height differences between adjacent columns
-        height_diffs = [abs(heights[i] - heights[i+1]) for i in range(len(heights)-1)]
-        avg_height_diff = sum(height_diffs) / len(height_diffs) if height_diffs else 0
-        
-        # Count holes
-        holes = self.count_holes(matrix)
-        if self.debug:
-            print(f"Holes: {holes}, Avg height diff: {avg_height_diff:.2f}")
-        
-        # Try to identify active piece
-        active_piece = self.identify_active_piece(matrix)
-        if self.debug and active_piece:
-            print(f"Active piece cells: {active_piece}")
-        
-        # Strategy based on analysis:
-        
-        # 1. If we have too many holes, try to fill them by moving towards lower columns
-        if holes > 3:
-            min_height_col = heights.index(min(heights))
-            # Move toward the lowest column
-            if active_piece and len(active_piece) > 0:
-                active_col = active_piece[0][1]  # Column of first active cell
-                if active_col < min_height_col:
-                    return 'RIGHT'
-                elif active_col > min_height_col:
-                    return 'LEFT'
-                else:
-                    return 'DROP'  # Drop if we're above the target column
-        
-        # 2. If the surface is very uneven, try to make it more even
-        if avg_height_diff > 1.5:
-            # Find the highest column
-            max_height_col = heights.index(max(heights))
-            
-            # Try to avoid placing pieces on the highest column
-            if active_piece and len(active_piece) > 0:
-                active_col = active_piece[0][1]
-                if active_col == max_height_col:
-                    # Move away from the highest column
-                    return 'LEFT' if max_height_col > self.matrix_width/2 else 'RIGHT'
-        
-        # 3. Occasionally rotate for better positioning
-        if random.random() < 0.3:
-            return random.choice(['ROTATE_CW', 'ROTATE_CCW'])
-            
-        # 4. Drop if we've found a good position
-        if random.random() < 0.15:
-            return 'DROP'
-            
-        # 5. Otherwise, make a semi-random move
-        return random.choice(['LEFT', 'RIGHT', 'DOWN'])
+        """Delegate move decision to the strategy class"""
+        return self.strategy.decide_move(matrix)
 
 
 def signal_handler(sig, frame):
@@ -436,11 +326,13 @@ if __name__ == "__main__":
         setattr(self, 'running', False),
         setattr(self, 'matrix_width', 10),
         setattr(self, 'matrix_height', 20),
-        setattr(self, 'last_matrix', None),
         setattr(self, 'debug', args.debug),
         setattr(self, 'game_paused', False),
         setattr(self, 'pause_start_time', 0),
-        setattr(self, 'last_resume_attempt', 0)
+        setattr(self, 'last_resume_attempt', 0),
+        setattr(self, 'game_over', False),
+        setattr(self, 'last_restart_attempt', 0),
+        setattr(self, 'strategy', None)
     )[-1]
     
     # Create and start the bot
